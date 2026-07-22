@@ -1,0 +1,14 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gds-idea-migrate-auto-version"
+version = "0.1.0"
+description = "One-command migration from manual version bumps to automatic tag-based versioning for GDS IDEA CDK repos"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = ["tomlkit>=0.13"]
+
+[project.scripts]
+migrate = "migrate_auto_version.main:main"
