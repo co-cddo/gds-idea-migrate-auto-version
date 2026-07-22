@@ -12,3 +12,6 @@ dependencies = ["tomlkit>=0.13"]
 
 [project.scripts]
 migrate = "migrate_auto_version.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/migrate_auto_version"]
