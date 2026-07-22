@@ -165,11 +165,12 @@ def check_not_already_migrated() -> None:
 # ---------------------------------------------------------------------------
 
 
-def detect_package_info() -> tuple[str, str, str]:
-    """Detect package name, module name, and current version from pyproject.toml.
+def detect_package_info() -> tuple[str, str, str, str]:
+    """Detect package name, module name, current version, and source layout.
 
     Returns:
-        (package_name, module_name, current_version)
+        (package_name, module_name, current_version, source_dir)
+        source_dir is "src" if using src layout, or "." if flat layout
     """
     pyproject = tomlkit.parse(Path("pyproject.toml").read_text())
 
@@ -184,25 +185,50 @@ def detect_package_info() -> tuple[str, str, str]:
     if not current_version:
         fatal("Could not find a hardcoded version in pyproject.toml. Is it already dynamic?")
 
-    # Module name: check [tool.uv.build-backend] first, then infer from package name
+    # Module name and source dir: check [tool.uv.build-backend] first
     uv_backend = pyproject.get("tool", {}).get("uv", {}).get("build-backend", {})
     module_name = uv_backend.get("module-name", "")
+    source_dir = uv_backend.get("source-dir", "")
 
     if not module_name:
         # Infer from package name (replace hyphens with underscores)
         module_name = package_name.replace("-", "_")
 
-    # Verify the module directory exists
-    src_path = Path("src") / module_name
-    if not src_path.is_dir():
-        fatal(f"Expected source directory {src_path} does not exist. Cannot detect module layout.")
+    # Detect source layout
+    if source_dir:
+        # Explicitly configured (e.g. source-dir = "src")
+        module_path = Path(source_dir) / module_name
+    elif (Path("src") / module_name).is_dir():
+        # Standard src layout
+        source_dir = "src"
+        module_path = Path("src") / module_name
+    elif Path(module_name).is_dir():
+        # Flat layout (module at root)
+        source_dir = "."
+        module_path = Path(module_name)
+    else:
+        fatal(
+            f"Cannot find module '{module_name}' in either src/{module_name}/ or {module_name}/.\n"
+            f"  Check that the module directory exists and matches the package name."
+        )
 
-    return package_name, module_name, current_version
+    if not module_path.is_dir():
+        fatal(f"Expected module directory {module_path} does not exist.")
+
+    return package_name, module_name, current_version, source_dir
 
 
-def edit_pyproject(module_name: str) -> None:
+def edit_pyproject(module_name: str, source_dir: str) -> None:
     """Edit pyproject.toml to use hatchling + hatch-vcs."""
     pyproject = tomlkit.parse(Path("pyproject.toml").read_text())
+
+    # Build the module path for config
+    if source_dir and source_dir != ".":
+        version_file = f"{source_dir}/{module_name}/_version.py"
+        packages_entry = f"{source_dir}/{module_name}"
+    else:
+        version_file = f"{module_name}/_version.py"
+        packages_entry = module_name
 
     # 1. Replace build-system
     pyproject["build-system"] = tomlkit.table()
@@ -266,7 +292,7 @@ def edit_pyproject(module_name: str) -> None:
     hooks = build["hooks"]
     if "vcs" not in hooks:
         hooks["vcs"] = tomlkit.table()
-    hooks["vcs"]["version-file"] = f"src/{module_name}/_version.py"
+    hooks["vcs"]["version-file"] = version_file
 
     # [tool.hatch.build.targets.wheel]
     if "targets" not in build:
@@ -276,16 +302,20 @@ def edit_pyproject(module_name: str) -> None:
     targets = build["targets"]
     if "wheel" not in targets:
         targets["wheel"] = tomlkit.table()
-    targets["wheel"]["packages"] = [f"src/{module_name}"]
+    targets["wheel"]["packages"] = [packages_entry]
 
     # Write back
     Path("pyproject.toml").write_text(tomlkit.dumps(pyproject))
 
 
-def edit_gitignore(module_name: str) -> None:
+def edit_gitignore(module_name: str, source_dir: str) -> None:
     """Add _version.py to .gitignore."""
     gitignore_path = Path(".gitignore")
-    entry = f"src/{module_name}/_version.py"
+
+    if source_dir and source_dir != ".":
+        entry = f"{source_dir}/{module_name}/_version.py"
+    else:
+        entry = f"{module_name}/_version.py"
 
     if gitignore_path.is_file():
         content = gitignore_path.read_text()
@@ -358,10 +388,7 @@ def create_seed_tag(version: str) -> None:
 
 
 def commit_and_pr() -> None:
-    """Create branch, commit changes, push, and create PR."""
-    # Create branch from current HEAD (which should be origin/dev based)
-    run(["git", "checkout", "-b", BRANCH_NAME], check=False)
-
+    """Commit changes, push, and create PR."""
     # Stage all changes
     run(["git", "add", "-A"])
 
@@ -413,10 +440,17 @@ def main() -> None:
     check_not_already_migrated()
 
     # Detect package info
-    package_name, module_name, current_version = detect_package_info()
+    package_name, module_name, current_version, source_dir = detect_package_info()
+
+    # Compute display paths
+    if source_dir and source_dir != ".":
+        version_file_path = f"{source_dir}/{module_name}/_version.py"
+    else:
+        version_file_path = f"{module_name}/_version.py"
 
     info(f"Package:         {package_name}")
     info(f"Module:          {module_name}")
+    info(f"Source layout:   {source_dir + '/' if source_dir != '.' else '(flat)'}")
     info(f"Current version: {current_version}")
 
     # Show plan
@@ -429,7 +463,7 @@ def main() -> None:
     info("   - Add [tool.hatch.version], [tool.hatch.build.hooks.vcs], [tool.hatch.build.targets.wheel]")
     info("")
     info("2. .gitignore:")
-    info(f"   - Add src/{module_name}/_version.py")
+    info(f"   - Add {version_file_path}")
     info("")
     info("3. .github/workflows/ci_pr_cdk_app.yml:")
     info("   - Set run-version-check: false on ci_pyproject_version job")
@@ -460,13 +494,15 @@ def main() -> None:
 
     # Ensure we're on a fresh branch from origin/dev
     info("Creating branch from origin/dev...")
-    run(["git", "checkout", "origin/dev"], check=False)
+    # Delete the branch if it already exists locally (e.g. from a previous failed run)
+    run(["git", "branch", "-D", BRANCH_NAME], check=False)
+    run(["git", "checkout", "-b", BRANCH_NAME, "origin/dev"])
 
     info("Editing pyproject.toml...")
-    edit_pyproject(module_name)
+    edit_pyproject(module_name, source_dir)
 
     info("Editing .gitignore...")
-    edit_gitignore(module_name)
+    edit_gitignore(module_name, source_dir)
 
     info("Editing PR workflow...")
     edit_pr_workflow()
