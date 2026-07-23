@@ -262,47 +262,28 @@ def edit_pyproject(module_name: str, source_dir: str) -> None:
             project["dynamic"].append("version")
 
     # 4. Add [tool.hatch.*] sections
-    if "hatch" not in pyproject.get("tool", {}):
-        if "tool" not in pyproject:
-            pyproject["tool"] = tomlkit.table()
+    # Build hatch config as a TOML string and merge it in, to avoid
+    # issues with tomlkit's super_table API across versions.
+    hatch_toml = tomlkit.parse(f"""
+[tool.hatch.version]
+source = "vcs"
 
-    # Ensure tool.hatch exists
+[tool.hatch.build.hooks.vcs]
+version-file = "{version_file}"
+
+[tool.hatch.build.targets.wheel]
+packages = ["{packages_entry}"]
+""")
+
+    # Ensure [tool] exists
+    if "tool" not in pyproject:
+        pyproject["tool"] = tomlkit.table()
+
     tool = pyproject["tool"]
-    if "hatch" not in tool:
-        tool["hatch"] = tomlkit.table()
-        tool["hatch"].is_super_table = True
 
-    hatch = tool["hatch"]
-
-    # [tool.hatch.version]
-    if "version" not in hatch:
-        hatch["version"] = tomlkit.table()
-    hatch["version"]["source"] = "vcs"
-
-    # [tool.hatch.build] -> [tool.hatch.build.hooks.vcs]
-    if "build" not in hatch:
-        hatch["build"] = tomlkit.table()
-        hatch["build"].is_super_table = True
-
-    build = hatch["build"]
-    if "hooks" not in build:
-        build["hooks"] = tomlkit.table()
-        build["hooks"].is_super_table = True
-
-    hooks = build["hooks"]
-    if "vcs" not in hooks:
-        hooks["vcs"] = tomlkit.table()
-    hooks["vcs"]["version-file"] = version_file
-
-    # [tool.hatch.build.targets.wheel]
-    if "targets" not in build:
-        build["targets"] = tomlkit.table()
-        build["targets"].is_super_table = True
-
-    targets = build["targets"]
-    if "wheel" not in targets:
-        targets["wheel"] = tomlkit.table()
-    targets["wheel"]["packages"] = [packages_entry]
+    # Merge hatch config into tool
+    hatch_config = hatch_toml["tool"]["hatch"]
+    tool["hatch"] = hatch_config
 
     # Write back
     Path("pyproject.toml").write_text(tomlkit.dumps(pyproject))
