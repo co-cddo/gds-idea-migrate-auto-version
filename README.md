@@ -25,6 +25,49 @@ The script will:
 | `uv-build` backend | `hatchling` + `hatch-vcs` backend |
 | CI fails if you forget to bump | CI doesn't check (nothing to check) |
 
+This is the default path, for repos with a real importable package at the
+root (a `src/<module>/` or `<module>/` directory matching the package name
+in `pyproject.toml`).
+
+### App-shaped repos (no importable root package)
+
+Some repos' root `pyproject.toml` doesn't describe an installable package at
+all -- e.g. a CDK app (`cdk.json`, `app.py`, `stacks/`) whose real runtime
+code lives in a separate sibling sub-project with its own `pyproject.toml`
+(a Dash/Flask app under `app_src/`, say). There's no module for `hatch-vcs`
+to version in that case, and nothing in the repo reads this file's version
+at build/runtime either -- its only consumer was the manual-bump check
+itself.
+
+The script detects this automatically (no importable module found, and no
+explicit `[tool.uv.build-backend]` override says otherwise) and takes a
+lighter path instead:
+
+| Before | After |
+|--------|-------|
+| Hardcoded `version = "x.y.z"` in `pyproject.toml` | Version history lives entirely in git tags / GitHub Releases |
+| Manual version bump required on every PR | No version editing needed |
+| Build backend unchanged | Build backend unchanged (there's nothing to build) |
+| CI fails if you forget to bump | CI doesn't check (nothing to check) |
+
+`pyproject.toml`'s `version` field is kept (PEP 440/`uv` require a
+numeric-leading version string to be present, dynamic or not) but replaced
+with a static placeholder plus an explanatory comment, e.g.:
+
+```toml
+version = "0.0.0+automatic"  # Versioning is automatic via git tags (see .github/workflows/release.yml) -- do not bump manually
+```
+
+This does not change how you find out what's actually deployed -- if the
+repo already derives that some other way (e.g. a git-SHA-derived env var
+baked into the running container), that's untouched.
+
+**Note:** a repo can have `cdk.json` *and* a real importable package at the
+same time (e.g. a Lambda deployed via CDK that's also a proper installable
+library) -- detection is based on whether a module directory actually
+exists, not on whether the repo looks like a CDK app, so that case still
+gets the full `hatch-vcs` treatment above.
+
 ## After migration
 
 | Action | Result |

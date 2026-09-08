@@ -12,9 +12,9 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import NoReturn
 
 import tomlkit
-
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -38,6 +38,16 @@ jobs:
 """
 
 BRANCH_NAME = "auto-version-bump"
+
+# Placeholder written into `pyproject.toml`'s `version` field for app-shaped
+# repos (see `edit_pyproject_app_shaped`). Must start with a digit to stay
+# PEP 440-valid -- the `+automatic` local-version segment is where the
+# human-readable signal lives.
+APP_VERSION_PLACEHOLDER = "0.0.0+automatic"
+APP_VERSION_COMMENT = (
+    "Versioning is automatic via git tags (see .github/workflows/release.yml) "
+    "-- do not bump manually"
+)
 
 COMMIT_MESSAGE = """\
 switch to hatch-vcs and auto-tag release on merge to dev
@@ -80,6 +90,59 @@ Replaces manual version bumping with automatic tag-based versioning.
 - Other branches can rebase on `dev` after this merges and drop their version bump commits\
 """
 
+APP_COMMIT_MESSAGE = f"""\
+stop manual version bumps and auto-tag release on merge to dev
+
+- Add release.yml workflow calling auto_tag_release from workflow catalogue
+- Disable ci_pyproject_version check (no longer needed with tag-based versioning)
+- Replace the hardcoded pyproject.toml version with a static placeholder
+  ("{APP_VERSION_PLACEHOLDER}") -- this repo has no importable package for hatch-vcs to
+  version, and nothing reads this field at runtime, so it is left inert
+  rather than rewired
+
+Version history now lives entirely in git tags / GitHub Releases. On merge
+to dev, a new patch tag is created by default. Use bump:minor or bump:major
+PR labels for larger version increments.\
+"""
+
+APP_PR_BODY = f"""\
+## What
+
+Replaces manual version bumping with automatic tag-based versioning.
+
+This repo has no importable package at the root -- `pyproject.toml` here \
+describes an app (e.g. a CDK app whose real runtime code lives in a \
+separate sub-project), not something that gets built into a wheel and \
+installed. So unlike the standard `hatch-vcs` migration, nothing needs to \
+read a version at build/runtime -- the `version` field's only consumer was \
+the manual-bump CI check itself, which this PR disables.
+
+## Changes
+
+- **New workflow**: `release.yml` calls `auto_tag_release.yml` from the workflow catalogue on push to `dev`
+- **Disabled**: `ci_pyproject_version` check (no hardcoded version to check)
+- **`pyproject.toml`**: `version` field replaced with a static placeholder \
+(`{APP_VERSION_PLACEHOLDER}`) and an explanatory comment -- kept present (rather than removed) \
+since PEP 440/`uv` require a numeric-leading version string here, but it is \
+no longer meaningful and should not be hand-edited
+
+## How it works after merge
+
+1. PRs no longer need a manual version bump
+2. On merge to `dev`, a new git tag is auto-created:
+   - Default: patch bump (e.g. `v0.1.14` -> `v0.1.15`)
+   - Label PR `bump:minor` for minor bump
+   - Label PR `bump:major` for major bump
+3. To find out what's actually deployed, use whatever mechanism this repo \
+already has for that (e.g. a git-SHA-derived env var baked into the running \
+container) -- this migration does not change or replace that
+
+## Notes
+
+- A seed tag has been pushed to establish the version history
+- Other branches can rebase on `dev` after this merges and drop their version bump commits\
+"""
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -91,7 +154,7 @@ def run(cmd: list[str], *, check: bool = True, capture: bool = True) -> subproce
     return subprocess.run(cmd, check=check, capture_output=capture, text=True)
 
 
-def fatal(msg: str) -> None:
+def fatal(msg: str) -> NoReturn:
     """Print an error and exit."""
     print(f"\n  ERROR: {msg}\n", file=sys.stderr)
     sys.exit(1)
@@ -165,12 +228,29 @@ def check_not_already_migrated() -> None:
 # ---------------------------------------------------------------------------
 
 
-def detect_package_info() -> tuple[str, str, str, str]:
+def detect_package_info() -> tuple[str, str, str, str | None]:
     """Detect package name, module name, current version, and source layout.
 
     Returns:
         (package_name, module_name, current_version, source_dir)
-        source_dir is "src" if using src layout, or "." if flat layout
+        source_dir is "src" if using src layout, "." if flat layout, or
+        `None` if no importable module could be found at all.
+
+        `None` is not necessarily an error: some repos' root `pyproject.toml`
+        describes an app rather than an installable package -- e.g. a CDK
+        app whose real runtime code lives in a separate sibling sub-project
+        (a Dash/Flask app under `app_src/`, with its own `pyproject.toml`).
+        There's nothing for `hatch-vcs` to version in that case, and nothing
+        in the repo reads this file's version at runtime either -- see
+        `edit_pyproject_app_shaped`. The caller decides whether that's fine
+        (fall back to the lighter app-shaped migration) or a genuine problem
+        (nothing else salvageable, e.g. a real library with a typo'd module
+        name would also hit this path and should probably be looked at by
+        hand rather than silently treated as app-shaped).
+
+        An *explicitly configured* `source-dir` that doesn't exist is always
+        treated as a real error, not this fallback -- the repo told us
+        exactly where to look and it wasn't there.
     """
     pyproject = tomlkit.parse(Path("pyproject.toml").read_text())
 
@@ -188,32 +268,31 @@ def detect_package_info() -> tuple[str, str, str, str]:
     # Module name and source dir: check [tool.uv.build-backend] first
     uv_backend = pyproject.get("tool", {}).get("uv", {}).get("build-backend", {})
     module_name = uv_backend.get("module-name", "")
-    source_dir = uv_backend.get("source-dir", "")
+    explicit_source_dir = uv_backend.get("source-dir", "")
 
     if not module_name:
         # Infer from package name (replace hyphens with underscores)
         module_name = package_name.replace("-", "_")
 
     # Detect source layout
-    if source_dir:
-        # Explicitly configured (e.g. source-dir = "src")
-        module_path = Path(source_dir) / module_name
+    if explicit_source_dir:
+        # Explicitly configured (e.g. source-dir = "src") -- trust it, and
+        # treat a missing directory as a real misconfiguration, not "no
+        # package here at all".
+        module_path = Path(explicit_source_dir) / module_name
+        if not module_path.is_dir():
+            fatal(f"Expected module directory {module_path} does not exist.")
+        source_dir: str | None = explicit_source_dir
     elif (Path("src") / module_name).is_dir():
         # Standard src layout
         source_dir = "src"
-        module_path = Path("src") / module_name
     elif Path(module_name).is_dir():
         # Flat layout (module at root)
         source_dir = "."
-        module_path = Path(module_name)
     else:
-        fatal(
-            f"Cannot find module '{module_name}' in either src/{module_name}/ or {module_name}/.\n"
-            f"  Check that the module directory exists and matches the package name."
-        )
-
-    if not module_path.is_dir():
-        fatal(f"Expected module directory {module_path} does not exist.")
+        # No module under either layout, and nothing explicitly configured
+        # to trust instead -- let the caller decide what this means.
+        source_dir = None
 
     return package_name, module_name, current_version, source_dir
 
@@ -286,6 +365,35 @@ packages = ["{packages_entry}"]
     tool["hatch"] = hatch_config
 
     # Write back
+    Path("pyproject.toml").write_text(tomlkit.dumps(pyproject))
+
+
+def edit_pyproject_app_shaped() -> None:
+    """Edit pyproject.toml for a repo with no importable root package.
+
+    Unlike `edit_pyproject`, this does not touch `[build-system]` or
+    `[tool.uv.build-backend]` -- there is no module for `hatch-vcs` to
+    version, and nothing in the repo reads this file's version at
+    build/runtime (see the CDK-app case this exists for: the real app
+    lives in a separate sub-project, and the deployed image is identified
+    by other means entirely, e.g. a git-SHA env var baked in at deploy
+    time -- not by anything in this file).
+
+    The hardcoded `version` string is replaced with a static placeholder
+    plus an explanatory comment, rather than removed outright or left as
+    a stale real-looking number: PEP 440 (and `uv`) require a
+    numeric-leading version string to be present here regardless of
+    whether it's dynamic, so it can't just be deleted, and leaving the
+    last hand-bumped number in place would misleadingly suggest it still
+    means something.
+    """
+    pyproject = tomlkit.parse(Path("pyproject.toml").read_text())
+
+    project = pyproject["project"]
+    placeholder = tomlkit.string(APP_VERSION_PLACEHOLDER)
+    placeholder.comment(APP_VERSION_COMMENT)
+    project["version"] = placeholder
+
     Path("pyproject.toml").write_text(tomlkit.dumps(pyproject))
 
 
@@ -368,13 +476,13 @@ def create_seed_tag(version: str) -> None:
     info(f"Created tag {tag} on origin/dev")
 
 
-def commit_and_pr() -> None:
+def commit_and_pr(commit_message: str, pr_title: str, pr_body: str) -> None:
     """Commit changes, push, and create PR."""
     # Stage all changes
     run(["git", "add", "-A"])
 
     # Commit
-    run(["git", "commit", "-m", COMMIT_MESSAGE])
+    run(["git", "commit", "-m", commit_message])
 
     # Push branch
     result = run(["git", "push", "origin", BRANCH_NAME], check=False)
@@ -394,8 +502,8 @@ def commit_and_pr() -> None:
         "gh", "pr", "create",
         "--base", "dev",
         "--head", BRANCH_NAME,
-        "--title", "Switch to hatch-vcs and auto-tag release on merge to dev",
-        "--body", PR_BODY,
+        "--title", pr_title,
+        "--body", pr_body,
     ], check=False)
 
     if result.returncode == 0:
@@ -411,30 +519,31 @@ def commit_and_pr() -> None:
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
-    """Entry point for the migration script."""
-    header("GDS IDEA - Migrate to Auto-Versioning")
+def confirm(prompt: str = "  Proceed? [y/N] ") -> bool:
+    """Ask the user to confirm, returning True only for an explicit yes."""
+    print()
+    response = input(prompt).strip().lower()
+    return response in ("y", "yes")
 
-    # Preconditions
-    info("Checking prerequisites...")
-    check_prerequisites()
-    check_not_already_migrated()
 
-    # Detect package info
-    package_name, module_name, current_version, source_dir = detect_package_info()
+def run_library_migration(
+    package_name: str, module_name: str, current_version: str, source_dir: str
+) -> None:
+    """Plan, confirm, and run the full hatch-vcs migration.
 
-    # Compute display paths
+    For a repo with a real importable package at `module_name` (found under
+    `source_dir`) -- the version becomes dynamic, derived from git tags via
+    `hatch-vcs`, and `importlib.metadata.version()` keeps working for any
+    code that already reads it.
+    """
     if source_dir and source_dir != ".":
         version_file_path = f"{source_dir}/{module_name}/_version.py"
     else:
         version_file_path = f"{module_name}/_version.py"
 
-    info(f"Package:         {package_name}")
     info(f"Module:          {module_name}")
     info(f"Source layout:   {source_dir + '/' if source_dir != '.' else '(flat)'}")
-    info(f"Current version: {current_version}")
 
-    # Show plan
     header("This script will make the following changes")
 
     info("1. pyproject.toml:")
@@ -463,19 +572,13 @@ def main() -> None:
     info("After merge, every subsequent merge to dev will auto-create a new patch tag.")
     info("Use PR labels bump:minor or bump:major for larger bumps.")
 
-    # Confirm
-    print()
-    response = input("  Proceed? [y/N] ").strip().lower()
-    if response not in ("y", "yes"):
+    if not confirm():
         info("Aborted.")
         sys.exit(0)
 
-    # Execute
     header("Migrating...")
 
-    # Ensure we're on a fresh branch from origin/dev
     info("Creating branch from origin/dev...")
-    # Delete the branch if it already exists locally (e.g. from a previous failed run)
     run(["git", "branch", "-D", BRANCH_NAME], check=False)
     run(["git", "checkout", "-b", BRANCH_NAME, "origin/dev"])
 
@@ -498,7 +601,104 @@ def main() -> None:
     create_seed_tag(current_version)
 
     info("Committing and creating PR...")
-    commit_and_pr()
+    commit_and_pr(
+        COMMIT_MESSAGE,
+        "Switch to hatch-vcs and auto-tag release on merge to dev",
+        PR_BODY,
+    )
+
+
+def run_app_shaped_migration(package_name: str, current_version: str) -> None:
+    """Plan, confirm, and run the lighter migration for a repo with no
+    importable root package (e.g. a CDK app whose real code lives in a
+    separate sub-project).
+
+    No `hatch-vcs`/build-backend changes -- there is no package for it to
+    version, and nothing reads this file's version at build/runtime. Only
+    the manual-bump CI gate and the release-on-merge workflow change.
+    """
+    header("This script will make the following changes")
+
+    info("No importable package found for this pyproject.toml -- treating")
+    info(f"'{package_name}' as an app-shaped repo (e.g. a CDK app whose real")
+    info("code lives in a separate sub-project). Skipping the hatch-vcs")
+    info("build-backend migration entirely; nothing reads this file's")
+    info("version at build/runtime, so there's nothing to wire it into.")
+    info("")
+    info("1. pyproject.toml:")
+    info(f"   - Replace hardcoded version ({current_version}) with a static")
+    info(f"     placeholder (\"{APP_VERSION_PLACEHOLDER}\") plus an explanatory comment")
+    info("")
+    info("2. .github/workflows/ci_pr_cdk_app.yml:")
+    info("   - Set run-version-check: false on ci_pyproject_version job")
+    info("")
+    info("3. .github/workflows/release.yml (NEW):")
+    info("   - Calls auto_tag_release.yml from workflow catalogue on push to dev")
+    info("")
+    info("4. Git:")
+    info(f"   - Create seed tag v{current_version} on origin/dev")
+    info(f"   - Create branch '{BRANCH_NAME}', commit, and push")
+    info("   - Create PR targeting dev")
+    info("")
+    info("After merge, every subsequent merge to dev will auto-create a new patch tag.")
+    info("Use PR labels bump:minor or bump:major for larger bumps.")
+    info("")
+    info("Note: this does not change how you find out what's actually deployed --")
+    info("if this repo already derives that from something else (e.g. a git-SHA")
+    info("env var baked into the running container), that's untouched.")
+
+    if not confirm():
+        info("Aborted.")
+        sys.exit(0)
+
+    header("Migrating...")
+
+    info("Creating branch from origin/dev...")
+    run(["git", "branch", "-D", BRANCH_NAME], check=False)
+    run(["git", "checkout", "-b", BRANCH_NAME, "origin/dev"])
+
+    info("Editing pyproject.toml...")
+    edit_pyproject_app_shaped()
+
+    info("Editing PR workflow...")
+    edit_pr_workflow()
+
+    info("Creating release.yml...")
+    create_release_workflow()
+
+    info("Regenerating uv.lock...")
+    regenerate_lock()
+
+    info(f"Creating seed tag v{current_version}...")
+    create_seed_tag(current_version)
+
+    info("Committing and creating PR...")
+    commit_and_pr(
+        APP_COMMIT_MESSAGE,
+        "Stop manual version bumps and auto-tag release on merge to dev",
+        APP_PR_BODY,
+    )
+
+
+def main() -> None:
+    """Entry point for the migration script."""
+    header("GDS IDEA - Migrate to Auto-Versioning")
+
+    # Preconditions
+    info("Checking prerequisites...")
+    check_prerequisites()
+    check_not_already_migrated()
+
+    # Detect package info
+    package_name, module_name, current_version, source_dir = detect_package_info()
+
+    info(f"Package:         {package_name}")
+    info(f"Current version: {current_version}")
+
+    if source_dir is None:
+        run_app_shaped_migration(package_name, current_version)
+    else:
+        run_library_migration(package_name, module_name, current_version, source_dir)
 
     # Done
     header("Migration complete!")
